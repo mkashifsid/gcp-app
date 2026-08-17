@@ -123,13 +123,11 @@ jobs:
           cluster_name: ${{ env.CLUSTER_NAME }}
           location: ${{ env.CLUSTER_ZONE }}
 
-      - name: Set image tags with kustomize
+      - name: Set image tags
         working-directory: k8s/overlays/${{ needs.determine-environment.outputs.environment }}
         run: |
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-          ./kustomize edit set image \
-            backend=${{ env.REPO }}/backend:${{ needs.determine-environment.outputs.image_tag }} \
-            frontend=${{ env.REPO }}/frontend:${{ needs.determine-environment.outputs.image_tag }}
+          sed -i "s|PLACEHOLDER_BACKEND_IMAGE|${{ env.REPO }}/backend:${{ needs.determine-environment.outputs.image_tag }}|" kustomization.yaml
+          sed -i "s|PLACEHOLDER_FRONTEND_IMAGE|${{ env.REPO }}/frontend:${{ needs.determine-environment.outputs.image_tag }}|" kustomization.yaml
 
       - name: Apply manifests
         run: kubectl apply -k k8s/overlays/${{ needs.determine-environment.outputs.environment }}
