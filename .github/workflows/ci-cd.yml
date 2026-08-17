@@ -1,0 +1,154 @@
+name: App CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches:
+      - main
+      - "release/**"
+      - "bug/**"
+
+permissions:
+  id-token: write # Workload Identity Federation
+  contents: read
+
+env:
+  REGION: us-central1
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REPO: ${{ secrets.ARTIFACT_REGISTRY_REPO }} # e.g. us-central1-docker.pkg.dev/PROJECT/demo-gke-repo
+  CLUSTER_NAME: demo-gke
+  CLUSTER_ZONE: us-central1-a
+
+jobs:
+  # ---- always runs: lint + basic checks, on PRs and pushes alike ----
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          pip install -r backend/requirements.txt -r frontend/requirements.txt
+          pip install flake8
+
+      - name: Lint
+        run: flake8 backend frontend --max-line-length=120
+
+      - name: Docker build (sanity check only, no push)
+        run: |
+          docker build -t backend:ci backend
+          docker build -t frontend:ci frontend
+
+  # ---- Regex-match the branch to decide which environment this run targets ----
+  # main            -> production
+  # release/*       -> staging (release candidate validation)
+  # bug/*           -> staging (hotfix validation)
+  # anything else / PRs -> no deploy, test job above is the only gate
+  determine-environment:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.route.outputs.environment }}
+      image_tag: ${{ steps.route.outputs.image_tag }}
+    steps:
+      - id: route
+        run: |
+          REF="${{ github.ref_name }}"
+          SHA_SHORT="${GITHUB_SHA::7}"
+
+          if [[ "$REF" == "main" ]]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "image_tag=main-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF" =~ ^release/ ]]; then
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+            echo "image_tag=release-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF" =~ ^bug/ ]]; then
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+            echo "image_tag=hotfix-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    needs: determine-environment
+    if: needs.determine-environment.outputs.environment != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.APP_CI_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push backend
+        run: |
+          docker build -t ${{ env.REPO }}/backend:${{ needs.determine-environment.outputs.image_tag }} backend
+          docker push ${{ env.REPO }}/backend:${{ needs.determine-environment.outputs.image_tag }}
+
+      - name: Build and push frontend
+        run: |
+          docker build -t ${{ env.REPO }}/frontend:${{ needs.determine-environment.outputs.image_tag }} frontend
+          docker push ${{ env.REPO }}/frontend:${{ needs.determine-environment.outputs.image_tag }}
+
+  deploy:
+    needs: [determine-environment, build-and-push]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }} # add required reviewers on "production" in repo Settings
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.APP_CI_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_ZONE }}
+
+      - name: Set image tags with kustomize
+        working-directory: k8s/overlays/${{ needs.determine-environment.outputs.environment }}
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          ./kustomize edit set image \
+            backend=${{ env.REPO }}/backend:${{ needs.determine-environment.outputs.image_tag }} \
+            frontend=${{ env.REPO }}/frontend:${{ needs.determine-environment.outputs.image_tag }}
+
+      - name: Apply manifests
+        run: kubectl apply -k k8s/overlays/${{ needs.determine-environment.outputs.environment }}
+
+      - name: Wait for rollout
+        run: |
+          NS=$( [[ "${{ needs.determine-environment.outputs.environment }}" == "production" ]] && echo demo-app || echo demo-app-staging )
+          kubectl -n "$NS" rollout status deployment/backend --timeout=180s
+          kubectl -n "$NS" rollout status deployment/frontend --timeout=180s
+
+      - name: Smoke test (staging - via port-forward, no public IP)
+        if: needs.determine-environment.outputs.environment == 'staging'
+        run: |
+          kubectl -n demo-app-staging port-forward svc/frontend 8080:80 &
+          sleep 5
+          curl -sf http://localhost:8080/ || (echo "smoke test failed" && exit 1)
+
+      - name: Smoke test (production - via public LB IP)
+        if: needs.determine-environment.outputs.environment == 'production'
+        run: |
+          IP=$(kubectl -n demo-app get ingress app-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl -sf "http://${IP}/" || (echo "smoke test failed" && exit 1)

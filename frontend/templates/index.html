@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GKE + Cloud SQL Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 60px auto; }
+    button { padding: 8px 16px; cursor: pointer; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>GKE + Cloud SQL Demo</h1>
+  <p>Frontend pod is serving this page. Click below to hit the backend, which queries Postgres on Cloud SQL.</p>
+  <button onclick="checkDb()">Call backend /api/dbtime</button>
+  <pre id="result">(no result yet)</pre>
+
+  <script>
+    async function checkDb() {
+      const res = await fetch('/api/dbtime');
+      const data = await res.json();
+      document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+    }
+  </script>
+</body>
+</html>
