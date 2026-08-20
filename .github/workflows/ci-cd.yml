@@ -18,7 +18,7 @@ env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   REPO: ${{ secrets.ARTIFACT_REGISTRY_REPO }} # e.g. us-central1-docker.pkg.dev/PROJECT/demo-gke-repo
   CLUSTER_NAME: demo-gke
-  CLUSTER_ZONE: us-central1-a
+  CLUSTER_REGION: us-central1
 
 jobs:
   # ---- always runs: lint + basic checks, on PRs and pushes alike ----
@@ -121,7 +121,7 @@ jobs:
       - uses: google-github-actions/get-gke-credentials@v2
         with:
           cluster_name: ${{ env.CLUSTER_NAME }}
-          location: ${{ env.CLUSTER_ZONE }}
+          location: ${{ env.CLUSTER_REGION }}
 
       - name: Set image tags
         working-directory: k8s/overlays/${{ needs.determine-environment.outputs.environment }}
